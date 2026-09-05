@@ -99,7 +99,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | ワークスペース | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | タブ | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.stream_output`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
 | エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
@@ -161,6 +161,27 @@ CLI の `herdr api snapshot` は、クライアントやエージェントが簡
 {"id":"graphics_stream","method":"pane.graphics.stream","params":{"pane_id":"w1:p1"}}
 {"format":"png","image_width":800,"image_height":600,"data_length":12345,"placement":{"viewport_col":0,"viewport_row":0,"grid_cols":80,"grid_rows":30}}
 ```
+
+### ペイン出力ストリーミング
+
+`pane.stream_output` は、1 つの接続を単一ペインのライブ端末出力(子プロセスが生成した生の PTY バイト列)に購読させます。フレームをクライアント側の端末エミュレーターにそのまま流し込めば、完全な忠実度で描画できます。ワンショットのスナップショットには引き続き `pane.read` を使ってください。省略可能な `replay` パラメーターは、最初に現在の表示画面を受け取る `"screen"`(デフォルト)か、以降のライブ出力のみを受け取る `"none"` です。
+
+```json
+{"id":"stream_out","method":"pane.stream_output","params":{"pane_id":"w1:p1","replay":"screen"}}
+```
+
+その後、クライアントが切断するかペインが終了するまで、接続は 1 行につき 1 つの JSON フレームを運びます。`data` フィールドは base64 です:
+
+```json
+{"type":"stream_started","pane_id":"w1:p1","cols":211,"rows":66}
+{"type":"repaint","data":"…","cols":211,"rows":66}
+{"type":"output","seq":1,"data":"…"}
+{"type":"resized","cols":180,"rows":50}
+{"type":"lag","dropped":true}
+{"type":"closed","reason":"pane_exited"}
+```
+
+`repaint` は表示画面を ANSI で表したものです。`output` フレームを適用する前に、そのままエミュレーターへ書き込んでください。複数の接続が同じペインを同時にストリーミングできます。読み取りの遅いクライアントがペインを遅くすることはありません。Herdr はそのクライアントのバックログを破棄して `lag` を送り、続けて新しい `repaint` を送って再同期します。
 
 `pane.layout` は、`workspace_id`、`tab_id`、`zoomed`、外側の `area`、`focused_pane_id`、ペインの矩形、分割の矩形/比率を含むタブレイアウトのスナップショットを返します。`pane.neighbor` と `pane.edges` は同じレイアウトスナップショットを含むので、クライアントは非公開のレイアウト状態なしに次の判断を下せます。
 

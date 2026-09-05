@@ -103,7 +103,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.stream_output`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -234,6 +234,36 @@ placement when the pane becomes visible again.
 `file_frame_damage: true` means Herdr accepts optional damage metadata for
 producer-side canonical-ring efficiency; it still copies or presents the full file.
 Resize and full redraw replay placements without retransmitting pixels.
+
+### Pane output streaming
+
+`pane.stream_output` subscribes one connection to a single pane's live terminal
+output — the raw PTY bytes as the child produces them. Feed the frames straight
+into a client-side terminal emulator for full-fidelity rendering; `pane.read`
+stays the right tool for one-shot snapshots. The optional `replay` parameter is
+`"screen"` (default) to receive the current visible screen first, or `"none"`
+for live output only.
+
+```json
+{"id":"stream_out","method":"pane.stream_output","params":{"pane_id":"w1:p1","replay":"screen"}}
+```
+
+The connection then carries one JSON frame per line until the client
+disconnects or the pane exits. `data` fields are base64:
+
+```json
+{"type":"stream_started","pane_id":"w1:p1","cols":211,"rows":66}
+{"type":"repaint","data":"…","cols":211,"rows":66}
+{"type":"output","seq":1,"data":"…"}
+{"type":"resized","cols":180,"rows":50}
+{"type":"lag","dropped":true}
+{"type":"closed","reason":"pane_exited"}
+```
+
+`repaint` is the visible screen as ANSI; write it verbatim to the emulator
+before applying `output` frames. Multiple connections can stream the same pane
+concurrently. A client that reads too slowly never slows the pane: Herdr drops
+its backlog, sends `lag`, and follows with a fresh `repaint` to resync.
 
 `pane.layout` returns the tab layout snapshot with `workspace_id`, `tab_id`,
 `zoomed`, outer `area`, `focused_pane_id`, pane rects, and split rects/ratios.

@@ -1134,6 +1134,16 @@ impl App {
             Method::PaneGraphicsStreamClose(params) => {
                 return self.handle_pane_graphics_stream_close(request.id, params);
             }
+            Method::PaneStreamOutput(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "stream_transport_required",
+                    "pane.stream_output requires the streaming socket transport",
+                );
+            }
+            Method::PaneStreamOutputOpen(params) => {
+                return self.handle_pane_stream_output_open(request.id, params);
+            }
             Method::PaneReportAgent(params) => {
                 return self.handle_pane_report_agent(request.id, params);
             }

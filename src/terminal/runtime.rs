@@ -564,6 +564,13 @@ impl TerminalRuntime {
     pub(crate) fn content_seq(&self) -> u64 {
         self.0.content_seq()
     }
+
+    pub(crate) fn subscribe_output(
+        &self,
+        replay_screen: bool,
+    ) -> crate::pane::PaneOutputSubscription {
+        self.0.subscribe_output(replay_screen)
+    }
 }
 
 #[cfg(test)]

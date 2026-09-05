@@ -13,7 +13,7 @@ use portable_pty::{native_pty_system, PtySize};
 use ratatui::{layout::Rect, Frame};
 #[cfg(test)]
 use tokio::sync::watch;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{broadcast, mpsc, Notify};
 #[cfg(not(windows))]
 use tracing::debug;
 use tracing::{error, info, warn};
@@ -1233,6 +1233,30 @@ async fn run_terminal_compression_task(
 /// PTY runtime for a pane. Owns the terminal, I/O channels, and background tasks.
 /// Dropping this aborts async tasks and closes the PTY. An already-running bounded
 /// compression step may finish before releasing its terminal reference.
+/// Bounded fan-out capacity for raw output subscribers, in PTY read chunks.
+/// A slow receiver observes `RecvError::Lagged` instead of ever blocking the
+/// PTY reader thread.
+const PANE_OUTPUT_BROADCAST_CAPACITY: usize = 1024;
+
+/// One frame on a pane's raw output subscription.
+#[derive(Debug, Clone)]
+pub enum PaneOutputFrame {
+    /// Raw PTY bytes exactly as produced by the child.
+    Output(Bytes),
+    /// The pane was resized; subscribers should resize their emulator.
+    Resized { cols: u16, rows: u16 },
+}
+
+/// A live raw-output subscription handed to an API stream handler.
+pub struct PaneOutputSubscription {
+    pub receiver: broadcast::Receiver<PaneOutputFrame>,
+    pub cols: u16,
+    pub rows: u16,
+    /// Present when the subscriber asked for a screen replay: the visible
+    /// screen as ANSI, coherent with the first frame the receiver will see.
+    pub repaint_ansi: Option<String>,
+}
+
 pub struct PaneRuntime {
     pane_id: PaneId,
     terminal: Arc<PaneTerminal>,
@@ -1245,6 +1269,7 @@ pub struct PaneRuntime {
     content_seq: Arc<AtomicU64>,
     content_write_lock: Arc<Mutex<()>>,
     detection_content_seq: Arc<AtomicU64>,
+    output_broadcast: broadcast::Sender<PaneOutputFrame>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
@@ -2131,6 +2156,7 @@ impl PaneRuntime {
         let content_seq = Arc::new(AtomicU64::new(0));
         let content_write_lock = Arc::new(Mutex::new(()));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let (output_broadcast, _) = broadcast::channel(PANE_OUTPUT_BROADCAST_CAPACITY);
 
         let io = {
             let terminal = terminal.clone();
@@ -2140,6 +2166,7 @@ impl PaneRuntime {
             let content_seq = content_seq.clone();
             let content_write_lock = content_write_lock.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let output_broadcast = output_broadcast.clone();
             let child_pid = child_pid.clone();
             let read_events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -2156,6 +2183,10 @@ impl PaneRuntime {
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 content_seq.fetch_add(1, Ordering::Release);
+                if output_broadcast.receiver_count() > 0 {
+                    let _ = output_broadcast
+                        .send(PaneOutputFrame::Output(Bytes::copy_from_slice(bytes)));
+                }
                 drop(_content_write_guard);
                 compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &read_events);
@@ -2228,6 +2259,7 @@ impl PaneRuntime {
             content_seq,
             content_write_lock,
             detection_content_seq,
+            output_broadcast,
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
@@ -2314,6 +2346,7 @@ impl PaneRuntime {
             });
         }
 
+        let (output_broadcast, _) = broadcast::channel(PANE_OUTPUT_BROADCAST_CAPACITY);
         let io = {
             let terminal = terminal.clone();
             let response_writer = response_tx.clone();
@@ -2322,6 +2355,7 @@ impl PaneRuntime {
             let content_seq = content_seq.clone();
             let content_write_lock = content_write_lock.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let output_broadcast = output_broadcast.clone();
             let child_pid = child_pid.clone();
             let events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -2337,6 +2371,10 @@ impl PaneRuntime {
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 content_seq.fetch_add(1, Ordering::Release);
+                if output_broadcast.receiver_count() > 0 {
+                    let _ = output_broadcast
+                        .send(PaneOutputFrame::Output(Bytes::copy_from_slice(bytes)));
+                }
                 drop(_content_write_guard);
                 compression_wake.wake();
                 publish_terminal_bells(pane_id, result.terminal_bells, &events);
@@ -2796,6 +2834,7 @@ impl PaneRuntime {
             content_seq,
             content_write_lock,
             detection_content_seq,
+            output_broadcast,
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
@@ -2842,6 +2881,29 @@ impl PaneRuntime {
         self.content_seq.load(Ordering::Acquire)
     }
 
+    /// Subscribe to this pane's raw output stream.
+    ///
+    /// Holding `content_write_lock` across subscribe + snapshot makes the
+    /// replay exact: every PTY chunk is either fully contained in the returned
+    /// repaint or delivered to the receiver, never both and never neither.
+    /// Dropping the receiver unsubscribes; the PTY reader never blocks on
+    /// subscribers (bounded channel, laggards observe `RecvError::Lagged`).
+    pub(crate) fn subscribe_output(&self, replay_screen: bool) -> PaneOutputSubscription {
+        let _content_write_guard = match self.content_write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let receiver = self.output_broadcast.subscribe();
+        let repaint_ansi = replay_screen.then(|| self.terminal.visible_ansi());
+        let (rows, cols, _, _) = self.current_size.get();
+        PaneOutputSubscription {
+            receiver,
+            cols,
+            rows,
+            repaint_ansi,
+        }
+    }
+
     /// Resize if the dimensions actually changed.
     pub fn resize(&self, rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) {
         let rows = rows.max(2);
@@ -2860,6 +2922,11 @@ impl PaneRuntime {
             .terminal
             .resize(rows, cols, cell_width_px, cell_height_px);
         self.content_seq.fetch_add(1, Ordering::Release);
+        if self.output_broadcast.receiver_count() > 0 {
+            let _ = self
+                .output_broadcast
+                .send(PaneOutputFrame::Resized { cols, rows });
+        }
         drop(_content_write_guard);
         self.compression.wake();
         mark_detection_content_changed(&self.detection_content_seq);
@@ -3321,6 +3388,14 @@ impl PaneRuntime {
         let (tx, _rx) = mpsc::channel(1);
         let _ = self.terminal.process_pty_bytes(self.pane_id, 0, bytes, &tx);
         self.content_seq.fetch_add(1, Ordering::Release);
+        // Mirror the production on_read tee so subscription tests exercise
+        // the same replay/live handoff ordering.
+        if self.output_broadcast.receiver_count() > 0 {
+            let _ = self
+                .output_broadcast
+                .send(PaneOutputFrame::Output(Bytes::copy_from_slice(bytes)));
+        }
+        drop(_content_write_guard);
         self.compression.wake();
     }
 
@@ -3367,6 +3442,7 @@ impl PaneRuntime {
                 content_seq: Arc::new(AtomicU64::new(0)),
                 content_write_lock: Arc::new(Mutex::new(())),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
+                output_broadcast: broadcast::channel(PANE_OUTPUT_BROADCAST_CAPACITY).0,
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
@@ -3401,6 +3477,90 @@ mod tests {
         apply_pane_terminal_env(&mut cmd);
 
         assert!(cmd.get_env("WT_SESSION").is_none());
+    }
+
+    #[tokio::test]
+    async fn output_subscription_replays_screen_and_streams_only_later_bytes() {
+        let runtime = PaneRuntime::test_with_screen_bytes(80, 24, b"before");
+
+        let mut subscription = runtime.subscribe_output(true);
+        assert_eq!((subscription.cols, subscription.rows), (80, 24));
+        let repaint = subscription.repaint_ansi.as_deref().expect("repaint");
+        assert!(repaint.contains("before"));
+
+        runtime.test_process_pty_bytes(b"after");
+        match subscription.receiver.try_recv().expect("live frame") {
+            PaneOutputFrame::Output(bytes) => assert_eq!(&bytes[..], b"after"),
+            other => panic!("unexpected frame: {other:?}"),
+        }
+        assert!(matches!(
+            subscription.receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn output_subscription_without_replay_omits_repaint() {
+        let runtime = PaneRuntime::test_with_screen_bytes(80, 24, b"seeded");
+        let subscription = runtime.subscribe_output(false);
+        assert!(subscription.repaint_ansi.is_none());
+    }
+
+    #[tokio::test]
+    async fn output_subscription_fans_out_to_concurrent_subscribers() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
+        let mut first = runtime.subscribe_output(false);
+        let mut second = runtime.subscribe_output(false);
+
+        runtime.test_process_pty_bytes(b"shared");
+
+        for subscription in [&mut first, &mut second] {
+            match subscription.receiver.try_recv().expect("frame") {
+                PaneOutputFrame::Output(bytes) => assert_eq!(&bytes[..], b"shared"),
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_output_subscriber_lags_instead_of_blocking_the_reader() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
+        let mut subscription = runtime.subscribe_output(false);
+
+        for _ in 0..(PANE_OUTPUT_BROADCAST_CAPACITY + 8) {
+            runtime.test_process_pty_bytes(b"x");
+        }
+
+        assert!(matches!(
+            subscription.receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn resize_notifies_output_subscribers() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
+        let mut subscription = runtime.subscribe_output(false);
+
+        runtime.resize(30, 100, 0, 0);
+
+        match subscription.receiver.try_recv().expect("resize frame") {
+            PaneOutputFrame::Resized { cols, rows } => assert_eq!((cols, rows), (100, 30)),
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_the_runtime_closes_output_subscriptions() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
+        let mut subscription = runtime.subscribe_output(false);
+
+        drop(runtime);
+
+        assert!(matches!(
+            subscription.receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        ));
     }
 
     #[tokio::test]
@@ -4031,6 +4191,7 @@ mod tests {
             content_seq: Arc::new(AtomicU64::new(0)),
             content_write_lock: Arc::new(Mutex::new(())),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            output_broadcast: broadcast::channel(PANE_OUTPUT_BROADCAST_CAPACITY).0,
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
@@ -4068,6 +4229,7 @@ mod tests {
             content_seq: Arc::new(AtomicU64::new(0)),
             content_write_lock: Arc::new(Mutex::new(())),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            output_broadcast: broadcast::channel(PANE_OUTPUT_BROADCAST_CAPACITY).0,
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),

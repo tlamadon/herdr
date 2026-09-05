@@ -1,5 +1,6 @@
 pub mod client;
 mod event_hub;
+pub(crate) mod output_stream;
 pub mod schema;
 mod server;
 mod status;

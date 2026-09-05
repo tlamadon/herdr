@@ -444,6 +444,34 @@ pub struct PaneGraphicsStreamParams {
     pub owner: String,
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneStreamOutputReplay {
+    /// Send the current visible screen as a repaint frame before live output.
+    #[default]
+    Screen,
+    /// Only stream bytes produced after the subscription is registered.
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneStreamOutputParams {
+    pub pane_id: String,
+    #[serde(default)]
+    pub replay: PaneStreamOutputReplay,
+}
+
+/// Internal open request dispatched by the streaming socket handler. The app
+/// registers the subscription under `token` for the handler to claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneStreamOutputOpenParams {
+    pub pane_id: String,
+    pub replay: PaneStreamOutputReplay,
+    pub token: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneReportAgentParams {
     pub pane_id: String,

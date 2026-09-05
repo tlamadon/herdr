@@ -99,7 +99,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | 工作区 | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.graphics.info`、`pane.graphics.set`、`pane.graphics.clear`、`pane.graphics.stream`、`pane.stream_output`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
 | 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
@@ -161,6 +161,27 @@ CLI 的 `herdr api snapshot` 会把当前 `session.snapshot` 响应输出为 JSO
 {"id":"graphics_stream","method":"pane.graphics.stream","params":{"pane_id":"w1:p1"}}
 {"format":"png","image_width":800,"image_height":600,"data_length":12345,"placement":{"viewport_col":0,"viewport_row":0,"grid_cols":80,"grid_rows":30}}
 ```
+
+### 窗格输出流
+
+`pane.stream_output` 让一个连接订阅单个窗格的实时终端输出——即子进程产生的原始 PTY 字节。把这些帧直接送入客户端的终端模拟器即可获得完全保真的渲染;一次性快照仍应使用 `pane.read`。可选的 `replay` 参数为 `"screen"`(默认,先接收当前可见屏幕)或 `"none"`(只接收之后的实时输出)。
+
+```json
+{"id":"stream_out","method":"pane.stream_output","params":{"pane_id":"w1:p1","replay":"screen"}}
+```
+
+之后连接每行携带一个 JSON 帧,直到客户端断开或窗格退出。`data` 字段为 base64:
+
+```json
+{"type":"stream_started","pane_id":"w1:p1","cols":211,"rows":66}
+{"type":"repaint","data":"…","cols":211,"rows":66}
+{"type":"output","seq":1,"data":"…"}
+{"type":"resized","cols":180,"rows":50}
+{"type":"lag","dropped":true}
+{"type":"closed","reason":"pane_exited"}
+```
+
+`repaint` 是以 ANSI 表示的可见屏幕;先原样写入模拟器,再应用 `output` 帧。多个连接可以同时流式读取同一个窗格。读取过慢的客户端不会拖慢窗格:Herdr 会丢弃其积压数据、发送 `lag`,并随后发送新的 `repaint` 以重新同步。
 
 `pane.layout` 返回标签页布局快照,包含 `workspace_id`、`tab_id`、`zoomed`、外层 `area`、`focused_pane_id`、窗格矩形和分割矩形/比例。`pane.neighbor` 和 `pane.edges` 也包含同一份布局快照,让客户端不需要私有布局状态就能做出下一步决策。
 
